@@ -1,86 +1,48 @@
-#!/usr/bin/env python3
-
-import os
 
 import numpy as np
 import time
+import os
 import matplotlib.pyplot as plt
-
-
+from mpl_toolkits.mplot3d import Axes3D
+from simulation_and_control import (
+    pb, MotorCommands, PinWrapper, 
+    velocity_to_wheel_angular_velocity
+)
 import pinocchio as pin
-from simulation_and_control import pb, MotorCommands, PinWrapper, feedback_lin_ctrl, SinusoidalReference, CartesianDiffKin, differential_drive_controller_adjusting_bearing
-from simulation_and_control import differential_drive_regulation_controller,regulation_polar_coordinates,regulation_polar_coordinate_quat,wrap_angle,velocity_to_wheel_angular_velocity
-# 从 standalone_localization_tester 文件导入类
-from standalone_localization_tester import SimulatorConfiguration, Controller, Simulator
+from regulator_model import RegulatorModel
 from robot_localization_system import FilterConfiguration, Map, RobotEstimator
-def __init__(self, sim_config, filter_config, map):
-        self._config = sim_config
-        self._filter_config = filter_config
-        self._map = map
 
-    # Reset the simulator to the start conditions
-def start(self):
-        self._time = 0
-        self._x_true = np.random.multivariate_normal(self._filter_config.x0,
-                                                     self._filter_config.Sigma0)
-        self._u = [0, 0]
+map = Map()
+landmarks = map.landmarks  # Use landmarks from Map class
 
-def set_control_input(self, u):
-        self._u = u
+# Measurement noise variances
+W_range = 0.5 ** 2  # Range measurement noise variance
+W_bearing = (np.pi * 0.5 / 180.0) ** 2  # Bearing measurement noise variance
 
-    # Predict the state forwards to the next timestep
-def step(self):
-        dt = self._config.dt
-        v_c = self._u[0]
-        omega_c = self._u[1]
-        v = np.random.multivariate_normal(
-            mean=[0, 0, 0], cov=self._filter_config.V * dt)
-        self._x_true = self._x_true + np.array([
-            v_c * np.cos(self._x_true[2]) * dt,
-            v_c * np.sin(self._x_true[2]) * dt,
-            omega_c * dt
-        ]) + v
-        self._x_true[-1] = np.arctan2(np.sin(self._x_true[-1]),
-                                      np.cos(self._x_true[-1]))
-        self._time += dt
-        return self._time
+# Calculate range measurements to landmarks
+def landmark_range_observations(base_position, W_range):
+    y = []
+    for lm in landmarks:
+        dx = lm[0] - base_position[0]
+        dy = lm[1] - base_position[1]
+        range_meas = np.sqrt(dx**2 + dy**2) + np.random.normal(0, np.sqrt(W_range))
+        y.append(range_meas)
+    return np.array(y)
 
-def landmark_range_observations(self):
-        y = []
-        C = []
-        W = self._filter_config.W_range
-        for lm in self._map.landmarks:
-            # True range measurement (with noise)
-            dx = lm[0] - self._x_true[0]
-            dy = lm[1] - self._x_true[1]
-            range_true = np.sqrt(dx**2 + dy**2)
-            range_meas = range_true + np.random.normal(0, np.sqrt(W))
-            y.append(range_meas)
+# Calculate bearing (angle) measurements to landmarks
+def landmark_bearing_observations(base_position, base_bearing):
+    y = []
+    for lm in landmarks:
+        dx = lm[0] - base_position[0]
+        dy = lm[1] - base_position[1]
+        bearing_true = np.arctan2(dy, dx) - base_bearing
+        bearing_meas = bearing_true + np.random.normal(0, np.sqrt(W_bearing))
+        # Constrain angle to [-π, π]
+        bearing_meas = np.arctan2(np.sin(bearing_meas), np.cos(bearing_meas))
+        y.append(bearing_meas)
+    return np.array(y)
 
-        y = np.array(y)
-        return y
-    
-def landmark_bearing_observations(self):
-        y = []
-        C = []
-        W = self._filter_config.W_bearing
-        for lm in self._map.landmarks:
-            dx = lm[0] - self._x_true[0]
-            dy = lm[1] - self._x_true[1]
-            
-            bearing_true = np.arctan2(dy, dx) - self._x_true[2]
-            bearing_meas = bearing_true + np.random.normal(0, np.sqrt(W))
-            #wrap the angle
-            bearing_meas = np.arctan2(np.sin(bearing_meas), np.cos(bearing_meas))
-            y.append(bearing_meas)
-
-        y = np.array(y)
-        return y
-
-def x_true(self):
-        return self._x_true
-
-# 定义四元数转偏航角的函数
+# Convert quaternion to yaw (bearing)
 def quaternion2bearing(q_w, q_x, q_y, q_z):
     quat = pin.Quaternion(q_w, q_x, q_y, q_z)
     quat.normalize()
@@ -88,8 +50,8 @@ def quaternion2bearing(q_w, q_x, q_y, q_z):
     base_euler = pin.rpy.matrixToRpy(rot_quat)
     return base_euler[2]
 
+# Initialize simulator
 def init_simulator(conf_file_name):
-    """Initialize simulation and dynamic model."""
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     sim = pb.SimInterface(conf_file_name, conf_file_path_ext=cur_dir, use_gui=True)
     
@@ -101,84 +63,112 @@ def init_simulator(conf_file_name):
     
     return sim, dyn_model, num_joints
 
-# 主程序逻辑
 def main():
     conf_file_name = "robotnik.json"
-    sim,dyn_model,num_joints=init_simulator(conf_file_name)
+    sim, dyn_model, num_joints = init_simulator(conf_file_name)
+
+    # Set floor friction
     sim.SetFloorFriction(100)
     time_step = sim.GetTimeStep()
-    
-    # 初始化模拟配置、地图和 EKF 估计器
-    sim_config = SimulatorConfiguration()
+    current_time = 0
+
+    # Initialize data storage
+    base_pos_all, base_bearing_all = [], []
+
+    # Initialize MPC
+    num_states = 3
+    num_controls = 2
+    C = np.eye(num_states)
+    N_mpc = 10
+
+    # Initialize regulator model
+    regulator = RegulatorModel(N_mpc, num_states, num_controls, num_states)
+
+    # Initial state and control
+    init_pos = np.array([2.0, 3.0])
+    init_quat = np.array([0, 0, 0.3827, 0.9239])
+    init_base_bearing_ = quaternion2bearing(init_quat[3], init_quat[0], init_quat[1], init_quat[2])
+    cur_state_x_for_linearization = [init_pos[0], init_pos[1], init_base_bearing_]
+    cur_u_for_linearization = np.zeros(num_controls)
+    regulator.updateSystemMatrices(sim, cur_state_x_for_linearization, cur_u_for_linearization)
+
+    # Define cost matrices
+    Qcoeff = np.array([310, 310, 80.0])
+    Rcoeff = 0.5
+    regulator.setCostMatrices(Qcoeff, Rcoeff)
+    u_mpc = np.zeros(num_controls)
+
+    # Initialize EKF
     filter_config = FilterConfiguration()
     map = Map()
     estimator = RobotEstimator(filter_config, map)
     estimator.start()
     
-    # 初始化控制器
-    controller = Controller(sim_config)
-    u = controller.next_control_input(*estimator.estimate())
-
-    base_pos_all = []
-    base_bearing_all = []
-
-    cmd = MotorCommands()  # Initialize command structure for motors
+    ##### Robot parameters ########
+    wheel_radius = 0.11
+    wheel_base_width = 0.46
+    cmd = MotorCommands()
     init_angular_wheels_velocity_cmd = np.array([0.0, 0.0, 0.0, 0.0])
     init_interface_all_wheels = ["velocity", "velocity", "velocity", "velocity"]
     cmd.SetControlCmd(init_angular_wheels_velocity_cmd, init_interface_all_wheels)
-    
-    # 进入主循环
-    for _ in range(sim_config.time_steps):
-        # 模拟时间推进
-        sim.Step(cmd, "torque")
 
-        # 获取无噪声的真实状态
+    # Main control loop
+    while True:
+        sim.Step(cmd, "torque")
+        # Simulation step
+        time_step = sim.GetTimeStep()
         base_pos_no_noise = sim.bot[0].base_position
         base_ori_no_noise = sim.bot[0].base_orientation
-        base_bearing_no_noise = quaternion2bearing(*base_ori_no_noise)
-        
-        # 获取带噪声的当前状态
+        base_bearing_no_noise_ = quaternion2bearing(base_ori_no_noise[3], base_ori_no_noise[0], base_ori_no_noise[1], base_ori_no_noise[2])
+        base_lin_vel_no_noise  = sim.bot[0].base_lin_vel
+        base_ang_vel_no_noise  = sim.bot[0].base_ang_vel
+        # Measurements of the current state (real measurements with noise) ##################################################################
         base_pos = sim.GetBasePosition()
         base_ori = sim.GetBaseOrientation()
-        base_bearing = quaternion2bearing(*base_ori)
-        
-        # 获取观测
-        y_range =  landmark_range_observations(base_pos)
-        y_bearing = landmark_bearing_observations(base_ori)
+        base_bearing_ = quaternion2bearing(base_ori[3], base_ori[0], base_ori[1], base_ori[2])
+        # LINES CHANGED IN THE LAST COMMIT (1 November 2024, 16:45)
+        y_range = landmark_range_observations(base_pos_no_noise,W_range)
+        y_bearing = landmark_bearing_observations(base_pos, base_bearing_)
 
-        # EKF 预测和更新
-        estimator.set_control_input(u)
-        estimator.predict_to(sim_config.dt)
-        estimator.update_from_landmark_observations(y_range, y_bearing)
+        # EKF prediction and update
+        estimator.set_control_input(u_mpc)  # Set control input
+        estimator.predict_to(time_step)     # Predict next state
+        estimator.update_from_landmark_observations(y_range, y_bearing)  # Update range and bearing measurements
 
-        # 获取估计结果
+        # Get current state estimate
         x_est, Sigma_est = estimator.estimate()
-        
-        # 更新控制器输入
-        u = controller.next_control_input(x_est, Sigma_est)
 
-        # 控制机器人轮子
-        left_wheel_velocity, right_wheel_velocity = velocity_to_wheel_angular_velocity(
-            u[0], u[1], 0.46, 0.11
-        )
+        # Update regulator model matrices
+        cur_state_x_for_linearization = [x_est[0], x_est[1], x_est[2]]
+        regulator.updateSystemMatrices(sim, x_est, u_mpc)
+        S_bar, T_bar, Q_bar, R_bar = regulator.propagation_model_regulator_fixed_std()
+        H, F = regulator.compute_H_and_F(S_bar, T_bar, Q_bar, R_bar)
+        x0_mpc = np.hstack((base_pos[:2], base_bearing_)).flatten()
+        
+        # Compute optimal control sequence
+        H_inv = np.linalg.inv(H)
+        u_mpc = -H_inv @ F @ x0_mpc
+        u_mpc = u_mpc[:num_controls]
+
+        # Prepare control command
+        left_wheel_velocity, right_wheel_velocity = velocity_to_wheel_angular_velocity(u_mpc[0], u_mpc[1], wheel_base_width, wheel_radius)
         angular_wheels_velocity_cmd = np.array([right_wheel_velocity, left_wheel_velocity, left_wheel_velocity, right_wheel_velocity])
-        cmd = MotorCommands()
-        cmd.SetControlCmd(angular_wheels_velocity_cmd, ["velocity", "velocity", "velocity", "velocity"])
+        interface_all_wheels = ["velocity", "velocity", "velocity", "velocity"]
+        cmd.SetControlCmd(angular_wheels_velocity_cmd,interface_all_wheels)
+
+        sim.Step(cmd, "torque")
+        print(f"u_mpc: {u_mpc}")
+        print(f"position X: {base_pos}")
+
+        # Check exit logic
+        keys = sim.GetPyBulletClient().getKeyboardEvents()
+        if ord('q') in keys and keys[ord('q')] and sim.GetPyBulletClient().KEY_WAS_TRIGGERED:
+            break
         
-        # 存储位置数据
-        base_pos_all.append(base_pos)
-        base_bearing_all.append(base_bearing)
+        # Store data for plotting
+        base_pos_all.append(base_pos_no_noise)
+        base_bearing_all.append(base_bearing_no_noise_)
 
-    # 绘图显示结果
-    plt.figure()
-    plt.plot([pos[0] for pos in base_pos_all], [pos[1] for pos in base_pos_all], label="Estimated Path")
-    plt.scatter([lm[0] for lm in map.landmarks], [lm[1] for lm in map.landmarks], marker='x', color='red', label='Landmarks')
-    plt.xlabel("X Position")
-    plt.ylabel("Y Position")
-    plt.title("EKF Localization with Estimated Path")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+        # Update current time
+        current_time += time_step
 
-if __name__ == "__main__":
-    main()
