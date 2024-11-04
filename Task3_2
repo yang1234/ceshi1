@@ -99,7 +99,7 @@ def main():
 
     # 定义成本矩阵
     Qcoeff = np.array([180, 180, -419])
-    Rcoeff = 1
+    Rcoeff = [1, 1]
     regulator.setCostMatrices(Qcoeff, Rcoeff)
     u_mpc = np.zeros(num_controls)
 
@@ -142,7 +142,7 @@ def main():
 
         # EKF 预测和更新
         estimator.set_control_input(u_mpc)
-        estimator.predict_to(time_step)
+        estimator.predict_to(current_time)
         estimator.update_from_landmark_observations(y_range, y_bearing)
 
         # 获取当前状态估计
